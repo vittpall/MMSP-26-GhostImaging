@@ -1,0 +1,7 @@
+{
+  "Full Model": {
+    "mse_mean": 0.0043665207539449104,
+    "mse_std": 0.002918354233934476,
+    "ssim_mean": 0.9169126693772642,
+    "ssim_std": 0.023091719346323644,
+    "temporal_consistency_mean": 
