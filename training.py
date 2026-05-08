@@ -14,6 +14,7 @@ from models.haar_temporal_ghost_gpt import HaarTemporalGhostGPT
 from models.cnn_ghost               import CNNGhost
 from models.unet_ghost              import UNetGhost
 from models.Ghost_GPT               import GhostGPT
+from models.fista_warm_dynghost     import FISTAWarmDynGhost, compute_warm_start
 from datasets import MovingMNISTGhost, MovingCIFAR10Ghost, KvasirGhost
 
 CHECKPOINT_DIR = './checkpoints'
@@ -27,14 +28,15 @@ os.makedirs('./outputs',     exist_ok=True)
 CONFIG = {
     # -------------------------------------------------------------------
     # MODEL — pick one:
-    #   'dynghost'  — Temporal Ghost-GPT (full model, uses speckle patterns)
-    #   'haarghost' — Temporal Ghost-GPT with Haar multi-scale tokenization
-    #                 (no speckle patterns needed at runtime)
-    #   'ghostgpt'  — Ghost-GPT          (single-frame, uses speckle patterns)
-    #   'cnn'       — CNN baseline       (no speckle patterns at runtime)
-    #   'unet'      — U-Net baseline     (no speckle patterns at runtime)
+    #   'dynghost'      — Temporal Ghost-GPT (full model, uses speckle patterns)
+    #   'haarghost'     — Temporal Ghost-GPT with Haar multi-scale tokenization
+    #                     (no speckle patterns needed at runtime)
+    #   'fistadynghost' — DynGhost + early-fusion DGI warm-start (patch tokens)
+    #   'ghostgpt'      — Ghost-GPT          (single-frame, uses speckle patterns)
+    #   'cnn'           — CNN baseline       (no speckle patterns at runtime)
+    #   'unet'          — U-Net baseline     (no speckle patterns at runtime)
     # -------------------------------------------------------------------
-    'model': 'haarghost',
+    'model': 'fistadynghost',
 
     # -------------------------------------------------------------------
     # DATASET — pick one:
@@ -62,6 +64,10 @@ CONFIG = {
 
     # HaarGhost-only — number of Haar decomposition levels
     'num_haar_levels': 3,
+
+    # FISTAWarmDynGhost-only — patch size for warm-start patch embedding
+    # 256/32 = 8 → 64 patches; must divide image_size evenly
+    'patch_size': 32,
 }
 
 # ============================================================================
@@ -177,9 +183,24 @@ def build_model(model_name, config, num_patterns, device):
         ).to(device)
         return model, True
 
+    elif model_name == 'fistadynghost':
+        model = FISTAWarmDynGhost(
+            d_in=config['embedding_dim'],
+            d_out=config['embedding_dim'],
+            num_blocks=config['num_blocks'],
+            number_of_heads=config['num_heads'],
+            embedding_dim=config['embedding_dim'],
+            flattened_image_size=config['image_size'] ** 2,
+            context_size=num_patterns,
+            final_image_size=config['image_size'] ** 2,
+            seq_length=config['seq_length'],
+            patch_size=config.get('patch_size', 32),
+        ).to(device)
+        return model, True   # uses speckle patterns (via warm-start computation)
+
     else:
         raise ValueError(f"Unknown model: {model_name}. "
-                         f"Choose from: dynghost, haarghost, ghostgpt, cnn, unet")
+                         f"Choose from: dynghost, haarghost, fistadynghost, ghostgpt, cnn, unet")
 
 # ============================================================================
 # FORWARD PASS WRAPPER
@@ -192,6 +213,9 @@ def forward(model, uses_patterns, patterns_flat, buckets, model_name=None, image
 
     GhostGPT is a single-frame model: we loop over the T dimension,
     run the model for each frame, then stack the results.
+
+    FISTAWarmDynGhost computes a DGI warm-start on-the-fly then calls
+    model(patterns_flat, buckets, warm_start).
     """
     if uses_patterns:
         if model_name == 'ghostgpt':
@@ -199,6 +223,10 @@ def forward(model, uses_patterns, patterns_flat, buckets, model_name=None, image
             H = W = image_size
             frames = [model(patterns_flat, buckets[:, t, :]) for t in range(T)]
             return torch.stack(frames, dim=1).view(B, T, H, W)
+        if model_name == 'fistadynghost':
+            H = W = image_size
+            warm = compute_warm_start(patterns_flat, buckets, H, W)
+            return model(patterns_flat, buckets, warm)
         return model(patterns_flat, buckets)
     else:
         return model(buckets)

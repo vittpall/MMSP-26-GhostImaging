@@ -9,10 +9,12 @@ from tqdm import tqdm
 import os
 import json
 
-from models.temporal_ghost_gpt import TemporalGhostGPT
-from models.temporal_ghost_gpt import GhostGPT
-from models.cnn_ghost           import CNNGhost
-from models.unet_ghost          import UNetGhost
+from models.temporal_ghost_gpt       import TemporalGhostGPT
+from models.temporal_ghost_gpt       import GhostGPT
+from models.cnn_ghost                import CNNGhost
+from models.unet_ghost               import UNetGhost
+from models.haar_temporal_ghost_gpt  import HaarTemporalGhostGPT
+from models.fista_warm_dynghost      import FISTAWarmDynGhost, compute_warm_start
 from datasets import MovingMNISTGhost, MovingCIFAR10Ghost, KvasirGhost
 
 import sys
@@ -30,34 +32,46 @@ DEVICE         = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # DynGhost checkpoint per dataset — set to None to skip
 CHECKPOINTS = {
-    #'mnist':   'checkpoints/temporal_ghost_gpt_final.pt',
-    'cifar10': 'checkpoints/dynghost_cifar10_final.pt',
-    'kvasir':  'checkpoints/temporal_ghost_gpt_kvasir_final.pt',
+    'mnist':   'checkpoints/temporal_ghost_gpt_final.pt',
+    #'cifar10': 'checkpoints/dynghost_cifar10_final.pt',
+    #'kvasir':  'checkpoints/temporal_ghost_gpt_kvasir_final.pt',
 }
 
 # CNN / U-Net checkpoints per dataset — set to None to skip
 CNN_CHECKPOINTS = {
     #'mnist':   'checkpoints/cnn_mnist_final.pt',
-    'cifar10': 'checkpoints/cnn_cifar10_final.pt',
-    'kvasir': 'checkpoints/cnn_kvasir_final.pt',
+    #'cifar10': 'checkpoints/cnn_cifar10_final.pt',
+    #'kvasir': 'checkpoints/cnn_kvasir_final.pt',
 }
 
 UNET_CHECKPOINTS = {
     #'mnist':   'checkpoints/unet_mnist_final.pt',
-    'cifar10': 'checkpoints/unet_cifar10_final.pt',
-    'kvasir': 'checkpoints/unet_kvasir_final.pt',
+    #'cifar10': 'checkpoints/unet_cifar10_final.pt',
+    #'kvasir': 'checkpoints/unet_kvasir_final.pt',
 }
 
 GHOSTGPT_CHECKPOINTS = {
     #'mnist':   'checkpoints/ghost_gpt_mnist_final.pt',
-    'cifar10': 'checkpoints/ghostgpt_cifar10_final.pt',
-    'kvasir':  'checkpoints/ghostgpt_kvasir_final.pt',
+    #'cifar10': 'checkpoints/ghostgpt_cifar10_final.pt',
+    #'kvasir':  'checkpoints/ghostgpt_kvasir_final.pt',
+}
+
+HAAR_CHECKPOINTS = {
+    'mnist':   'checkpoints/haarghost_mnist_final.pt',
+    #'cifar10': 'checkpoints/haar_ghost_cifar10_final.pt',
+    #'kvasir':  'checkpoints/haar_ghost_kvasir_final.pt',
+}
+
+FISTADYNGHOST_CHECKPOINTS = {
+    'mnist':   'checkpoints/fistadynghost_mnist_final.pt',
+    #'cifar10': 'checkpoints/fistadynghost_cifar10_final.pt',
+    #'kvasir':  'checkpoints/fistadynghost_kvasir_final.pt',
 }
 
 DATASET_LABELS = {
     'mnist':   'Moving MNIST',
-    'cifar10': 'Moving CIFAR-10',
-    'kvasir': 'Kvasir Endoscopy',
+    #'cifar10': 'Moving CIFAR-10',
+    #'kvasir': 'Kvasir Endoscopy',
 }
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -136,6 +150,44 @@ def load_unet_model(checkpoint_path, num_patterns, device):
                             weights_only=False)
     if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
         model.load_state_dict(checkpoint['model_state_dict'])
+    else:
+        model.load_state_dict(checkpoint)
+    model.eval()
+    return model
+
+
+def load_haar_model(checkpoint_path, num_patterns, device):
+    model = HaarTemporalGhostGPT(
+        d_in=32, d_out=32, num_blocks=8, number_of_heads=8,
+        embedding_dim=32, num_patterns=num_patterns,
+        final_image_size=256 * 256, seq_length=8,
+    ).to(device)
+    checkpoint = torch.load(checkpoint_path, map_location=device,
+                            weights_only=False)
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'])
+        print(f"  Loaded epoch {checkpoint.get('epoch', '?')} "
+              f"[{checkpoint.get('dataset', '?')}]")
+    else:
+        model.load_state_dict(checkpoint)
+    model.eval()
+    return model
+
+
+def load_fistadynghost_model(checkpoint_path, num_patterns, device,
+                              patch_size=32):
+    model = FISTAWarmDynGhost(
+        d_in=32, d_out=32, num_blocks=8, number_of_heads=8,
+        embedding_dim=32, flattened_image_size=256 * 256,
+        context_size=num_patterns, final_image_size=256 * 256,
+        seq_length=8, patch_size=patch_size,
+    ).to(device)
+    checkpoint = torch.load(checkpoint_path, map_location=device,
+                            weights_only=False)
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'])
+        print(f"  Loaded epoch {checkpoint.get('epoch', '?')} "
+              f"[{checkpoint.get('dataset', '?')}]")
     else:
         model.load_state_dict(checkpoint)
     model.eval()
@@ -281,6 +333,49 @@ def evaluate_ghostgpt_model(model, dataset, patterns_flat, device,
     }
 
 
+def evaluate_fistadynghost_model(model, dataset, patterns_flat, device,
+                                  num_samples=100):
+    """FISTAWarmDynGhost — DGI warm-start computed on-the-fly per sample."""
+    model.eval()
+    all_mse, all_ssim, times = [], [], []
+    frame_mse, frame_ssim    = [], []
+    H = W = int(patterns_flat.shape[-1] ** 0.5)
+
+    with torch.no_grad():
+        for i in tqdm(range(min(num_samples, len(dataset))),
+                      desc="  FISTAWarmDynGhost"):
+            sample    = dataset[i]
+            buckets   = sample['buckets'].unsqueeze(0).to(device)   # [1, T, M]
+            frames_gt = sample['frames']                             # [T, H, W]
+
+            warm = compute_warm_start(patterns_flat, buckets, H, W) # [1, T, H, W]
+
+            start       = time.time()
+            pred_frames = model(patterns_flat, buckets, warm).squeeze(0).cpu()
+            times.append(time.time() - start)
+
+            s_mse, s_ssim = [], []
+            for t in range(frames_gt.shape[0]):
+                m, s = compute_metrics(pred_frames[t], frames_gt[t])
+                s_mse.append(m);  s_ssim.append(s)
+
+            all_mse.append(np.mean(s_mse))
+            all_ssim.append(np.mean(s_ssim))
+            frame_mse.append(s_mse)
+            frame_ssim.append(s_ssim)
+
+    return {
+        'mse_mean':     np.mean(all_mse),
+        'mse_std':      np.std(all_mse),
+        'ssim_mean':    np.mean(all_ssim),
+        'ssim_std':     np.std(all_ssim),
+        'time_mean_ms': np.mean(times) * 1000,
+        'time_std_ms':  np.std(times)  * 1000,
+        'frame_mse':    np.mean(frame_mse,  axis=0).tolist(),
+        'frame_ssim':   np.mean(frame_ssim, axis=0).tolist(),
+    }
+
+
 def evaluate_classical_algorithms(dataset, speckle_patterns,
                                    num_samples=30):
     """DGI, PI, FISTA on the middle frame of each sequence."""
@@ -330,8 +425,8 @@ def print_table(results_dict, dataset_label):
     print(f"{'='*80}")
     print(f"{'Method':<28} {'MSE':^22} {'SSIM':^22} {'Time (ms)':^18}")
     print(f"{'-'*80}")
-    order = ['DynGhost (ours)', 'GhostGPT', 'CNN', 'U-Net',
-             'DGI', 'PI', 'FISTA']
+    order = ['DynGhost (ours)', 'FISTAWarmDynGhost', 'GhostGPT', 'HaarGhost',
+             'CNN', 'U-Net', 'DGI', 'PI', 'FISTA']
     printed = set()
     for name in order + [k for k in results_dict if k not in order]:
         if name in results_dict and name not in printed:
@@ -354,7 +449,7 @@ def plot_dataset_comparison(all_dataset_results,
     methods     = list(method_sets[0].intersection(*method_sets[1:]))
 
     # Fixed display order
-    order = ['DynGhost (ours)', 'GhostGPT', 'CNN', 'U-Net', 'DGI', 'PI', 'FISTA']
+    order = ['DynGhost (ours)', 'GhostGPT', 'HaarGhost', 'CNN', 'U-Net', 'DGI', 'PI', 'FISTA']
     methods = [m for m in order if m in methods] + \
               [m for m in methods if m not in order]
 
@@ -406,7 +501,7 @@ def plot_ssim_bars_per_dataset(all_dataset_results,
     if n_datasets == 1:
         axes = [axes]
 
-    order = ['DynGhost (ours)', 'CNN', 'U-Net', 'DGI', 'PI', 'FISTA']
+    order = ['DynGhost (ours)', 'GhostGPT', 'HaarGhost', 'CNN', 'U-Net', 'DGI', 'PI', 'FISTA']
 
     for ax, (dname, results) in zip(axes, all_dataset_results.items()):
         methods   = [m for m in order if m in results] + \
@@ -478,16 +573,18 @@ def plot_temporal_consistency(model, dataset, patterns_flat, device,
     print(f"Saved: {save_path}")
 
 
-def visualize_reconstructions(dynghost_model, ghostgpt_model, cnn_model,
-                               unet_model, dataset, patterns_flat,
-                               speckle_patterns, device,
+def visualize_reconstructions(dynghost_model, ghostgpt_model, haar_model,
+                               cnn_model, unet_model, fistadynghost_model,
+                               dataset, patterns_flat, speckle_patterns, device,
                                dataset_name='mnist', num_samples=3):
-    """GT | DynGhost | GhostGPT | CNN | U-Net | DGI | PI | FISTA."""
-    fig, axes = plt.subplots(num_samples, 8,
-                              figsize=(24, 3 * num_samples))
-    col_titles = ['Ground truth', 'DynGhost (ours)', 'GhostGPT',
-                  'CNN', 'U-Net',
+    """GT | DynGhost | FISTAWarm | GhostGPT | HaarGhost | CNN | U-Net | DGI | PI | FISTA."""
+    fig, axes = plt.subplots(num_samples, 10,
+                              figsize=(30, 3 * num_samples))
+    col_titles = ['Ground truth', 'DynGhost (ours)', 'FISTAWarmDynGhost',
+                  'GhostGPT', 'HaarGhost', 'CNN', 'U-Net',
                   'DGI', 'Pseudo-inv.', 'FISTA']
+
+    H_img = W_img = int(patterns_flat.shape[-1] ** 0.5)
 
     with torch.no_grad():
         for i in range(num_samples):
@@ -497,11 +594,22 @@ def visualize_reconstructions(dynghost_model, ghostgpt_model, cnn_model,
             t         = buckets.shape[0] // 2
             frame_gt  = frames_gt[t].numpy()
             bucket_t  = buckets[t].numpy()
+            buckets_dev = buckets.unsqueeze(0).to(device)   # [1, T, M]
 
             # DynGhost
             pred_dynghost = dynghost_model(
-                patterns_flat, buckets.unsqueeze(0).to(device)
+                patterns_flat, buckets_dev
             )[0, t].cpu().numpy()
+
+            # FISTAWarmDynGhost
+            if fistadynghost_model is not None:
+                warm = compute_warm_start(patterns_flat, buckets_dev,
+                                          H_img, W_img)
+                pred_fistadyn = fistadynghost_model(
+                    patterns_flat, buckets_dev, warm
+                )[0, t].cpu().numpy()
+            else:
+                pred_fistadyn = np.zeros_like(frame_gt)
 
             # GhostGPT
             if ghostgpt_model is not None:
@@ -512,10 +620,18 @@ def visualize_reconstructions(dynghost_model, ghostgpt_model, cnn_model,
             else:
                 pred_ghostgpt = np.zeros_like(frame_gt)
 
+            # HaarGhost
+            if haar_model is not None:
+                pred_haar = haar_model(
+                    buckets_dev
+                )[0, t].cpu().numpy()
+            else:
+                pred_haar = np.zeros_like(frame_gt)
+
             # CNN
             if cnn_model is not None:
                 pred_cnn = cnn_model(
-                    buckets.unsqueeze(0).to(device)
+                    buckets_dev
                 )[0, t].cpu().numpy()
             else:
                 pred_cnn = np.zeros_like(frame_gt)
@@ -523,7 +639,7 @@ def visualize_reconstructions(dynghost_model, ghostgpt_model, cnn_model,
             # U-Net
             if unet_model is not None:
                 pred_unet = unet_model(
-                    buckets.unsqueeze(0).to(device)
+                    buckets_dev
                 )[0, t].cpu().numpy()
             else:
                 pred_unet = np.zeros_like(frame_gt)
@@ -533,8 +649,8 @@ def visualize_reconstructions(dynghost_model, ghostgpt_model, cnn_model,
             pred_pi    = PseudoInverse_Recon(speckle_patterns, bucket_t)
             pred_fista = FISTA_Recon(speckle_patterns, bucket_t, eps=50)
 
-            preds = [frame_gt, pred_dynghost, pred_ghostgpt,
-                     pred_cnn, pred_unet,
+            preds = [frame_gt, pred_dynghost, pred_fistadyn,
+                     pred_ghostgpt, pred_haar, pred_cnn, pred_unet,
                      pred_dgi, pred_pi, pred_fista]
 
             for j, (pred, title) in enumerate(zip(preds, col_titles)):
@@ -649,6 +765,37 @@ def main():
             print(f"\nGhostGPT checkpoint not found for {dataset_name} "
                   f"— skipping")
 
+        # ---- HaarGhost ----
+        haar_ckpt = HAAR_CHECKPOINTS.get(dataset_name)
+        haar_model = None
+        if haar_ckpt and os.path.exists(haar_ckpt):
+            print("\nLoading HaarGhost...")
+            haar_model = load_haar_model(haar_ckpt, num_patterns, DEVICE)
+            print("Evaluating HaarGhost...")
+            results['HaarGhost'] = evaluate_dl_model(
+                haar_model, dataset, DEVICE,
+                num_samples=100, desc='HaarGhost'
+            )
+        else:
+            print(f"\nHaarGhost checkpoint not found for {dataset_name} "
+                  f"— skipping")
+
+        # ---- FISTAWarmDynGhost ----
+        fistadynghost_ckpt = FISTADYNGHOST_CHECKPOINTS.get(dataset_name)
+        fistadynghost_model = None
+        if fistadynghost_ckpt and os.path.exists(fistadynghost_ckpt):
+            print("\nLoading FISTAWarmDynGhost...")
+            fistadynghost_model = load_fistadynghost_model(
+                fistadynghost_ckpt, num_patterns, DEVICE)
+            print("Evaluating FISTAWarmDynGhost...")
+            results['FISTAWarmDynGhost'] = evaluate_fistadynghost_model(
+                fistadynghost_model, dataset, patterns_flat, DEVICE,
+                num_samples=100
+            )
+        else:
+            print(f"\nFISTAWarmDynGhost checkpoint not found for "
+                  f"{dataset_name} — skipping")
+
         # ---- Classical ----
         print("\nEvaluating classical algorithms...")
         classical = evaluate_classical_algorithms(
@@ -662,10 +809,10 @@ def main():
         # Per-dataset plots
         plot_temporal_consistency(dynghost, dataset, patterns_flat,
                                   DEVICE, dataset_name)
-        visualize_reconstructions(dynghost, ghostgpt_model, cnn_model,
-                                  unet_model, dataset, patterns_flat,
-                                  speckle_patterns, DEVICE,
-                                  dataset_name)
+        visualize_reconstructions(dynghost, ghostgpt_model, haar_model,
+                                  cnn_model, unet_model, fistadynghost_model,
+                                  dataset, patterns_flat, speckle_patterns,
+                                  DEVICE, dataset_name)
 
     # ---- Cross-dataset plots ----
     if len(all_dataset_results) > 1:
@@ -683,7 +830,8 @@ def main():
     print(f"\n{'='*60}")
     print("SUMMARY — SSIM across datasets")
     print(f"{'='*60}")
-    order = ['DynGhost (ours)', 'GhostGPT', 'CNN', 'U-Net', 'DGI', 'PI', 'FISTA']
+    order = ['DynGhost (ours)', 'FISTAWarmDynGhost', 'GhostGPT', 'HaarGhost',
+             'CNN', 'U-Net', 'DGI', 'PI', 'FISTA']
     for dname, results in all_dataset_results.items():
         print(f"\n  {DATASET_LABELS[dname]}")
         for method in order:

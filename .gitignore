@@ -4,3 +4,4 @@ logs/*
 output/*
 data
 checkpoints
+outputs/*
