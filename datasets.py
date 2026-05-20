@@ -4,7 +4,9 @@ from torchvision import datasets, transforms
 import numpy as np
 from PIL import Image
 import os
-
+import glob
+import random
+import torchvision.transforms.functional as TF
 
 # ============================================================================
 # 1. MOVING MNIST GHOST IMAGING DATASET (unchanged)
@@ -363,6 +365,98 @@ class KvasirGhost(torch.utils.data.Dataset):
 
     def __len__(self):
         return self.dataset_size
+
+
+
+# ============================================================================
+# 4. DAVIS VIDEO SEQUENCE GHOST IMAGING DATASET
+# ============================================================================
+
+
+class DAVISGhost(torch.utils.data.Dataset):
+
+    def __init__(self, davis_root, speckle_patterns,
+                 seq_length=8, image_size=256,
+                 train=True, dataset_size=None,
+                 noise_std=0.01):
+
+        self.davis_root      = davis_root
+        self.speckle         = speckle_patterns          # [M, H, W] numpy
+        self.seq_length      = seq_length
+        self.image_size      = image_size
+        self.noise_std       = noise_std
+        self.M               = speckle_patterns.shape[0]
+
+        # Flatten patterns once: [M, H*W]
+        self.patterns_flat = speckle_patterns.reshape(self.M, -1).astype(np.float32)
+
+        # Load sequence list
+        split     = 'train' if train else 'val'
+        list_file = os.path.join(davis_root, 'ImageSets', '2017', f'{split}.txt')
+
+        if os.path.exists(list_file):
+            with open(list_file) as f:
+                sequences = [l.strip() for l in f if l.strip()]
+        else:
+            # Fallback: use all sequences found in JPEGImages/480p
+            img_root  = os.path.join(davis_root, 'JPEGImages', '480p')
+            sequences = sorted(os.listdir(img_root))
+            # 80/20 split if no list file
+            n = len(sequences)
+            sequences = sequences[:int(0.8*n)] if train else sequences[int(0.8*n):]
+
+        # Build list of (sequence, start_frame) pairs
+        self.samples = []
+        img_root     = os.path.join(davis_root, 'JPEGImages', '480p')
+
+        for seq in sequences:
+            seq_dir = os.path.join(img_root, seq)
+            if not os.path.isdir(seq_dir):
+                continue
+            frames = sorted(glob.glob(os.path.join(seq_dir, '*.jpg')))
+            # Slide a window of seq_length across the sequence
+            for start in range(0, len(frames) - seq_length + 1, seq_length // 2):
+                self.samples.append(frames[start:start + seq_length])
+
+        if dataset_size is not None:
+            random.shuffle(self.samples)
+            self.samples = self.samples[:dataset_size]
+
+        print(f"DAVISGhost: {len(sequences)} sequences, "
+              f"{len(self.samples)} clips ({'train' if train else 'val'})")
+
+    def _load_frame(self, path):
+        """Load JPEG, convert to grayscale, resize, normalize to [0,1]."""
+        img = Image.open(path).convert('L')
+        img = TF.resize(img, (self.image_size, self.image_size),
+                        interpolation=Image.BILINEAR)
+        return np.array(img, dtype=np.float32) / 255.0
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        frame_paths = self.samples[idx]
+
+        # Load frames
+        frames = np.stack([self._load_frame(p) for p in frame_paths], axis=0)
+        # frames: [T, H, W]
+
+        # Simulate ghost imaging measurements
+        # b_m^(t) = sum_{i,j} A_{m,i,j} * x^(t)_{i,j} + noise
+        frames_flat = frames.reshape(self.seq_length, -1)     # [T, H*W]
+        buckets     = frames_flat @ self.patterns_flat.T       # [T, M]
+        buckets    += np.random.randn(*buckets.shape).astype(np.float32) * self.noise_std
+
+        # Normalize buckets to [0, 1]
+        b_min = buckets.min(axis=1, keepdims=True)
+        b_max = buckets.max(axis=1, keepdims=True)
+        buckets = (buckets - b_min) / (b_max - b_min + 1e-8)
+
+        return {
+            'buckets': torch.tensor(buckets, dtype=torch.float32),   # [T, M]
+            'frames':  torch.tensor(frames,  dtype=torch.float32),   # [T, H, W]
+        }
 
 
 # ============================================================================

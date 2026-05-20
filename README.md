@@ -49,7 +49,6 @@ temporal_ghost_imaging/
 ├── datasets.py               # Dataset classes (MNIST, CIFAR-10, Kvasir)
 ├── datasets_quantum.py       # Quantum-noise dataset variants
 ├── environment.yml           # Conda environment specification
-├── training.pbs              # PBS job script for HPC clusters (ALCF)
 │
 ├── models/
 │   ├── temporal_ghost_gpt.py   # DynGhost — Temporal Ghost-GPT
@@ -198,16 +197,6 @@ checkpoints/<model>_<dataset>_final.pt
 ```
 
 Training automatically resumes from the latest checkpoint if one exists for the selected model/dataset combination.
-
-### Training on an HPC cluster (PBS)
-
-A PBS job script is provided for ALCF systems (Sophia/Polaris):
-
-```bash
-qsub training.pbs
-```
-
-Edit `training.pbs` to adjust queue, walltime, and project allocation as needed.
 
 ---
 

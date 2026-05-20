@@ -1,7 +1,7 @@
 #!/bin/bash
 #PBS -l select=1
-#PBS -l walltime=01:00:00
-#PBS -q debug
+#PBS -l walltime=06:00:00
+#PBS -q by-gpu
 #PBS -l filesystems=home
 #PBS -A UIC-HPC
 #PBS -o logs/
@@ -14,9 +14,31 @@ module load conda
 #module load cray-mpich
 conda activate ghost-imaging
 
+nvidia-smi         # shows driver version
+nvcc --version     # shows toolkit version in the env
+python -c "import torch; print(torch.version.cuda)"
+
+export LD_LIBRARY_PATH=/lib64:$LD_LIBRARY_PATH
+
+# Verify it's now findable
+python -c "
+import ctypes
+lib = ctypes.cdll.LoadLibrary('libcuda_wrapper.so')
+print('loaded OK')
+"
+
+# Then test PyTorch
+python -c "
+import torch
+print('CUDA available:', torch.cuda.is_available())
+print('GPU:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'N/A')
+"
+
 #GPUS_PER_NODE=4
+# python evaluate.py
+# python training.py --model dynghost \
+#                 --dataset mnist \
 
-
-python evaluate.py
-
-
+python train_eval_sampling.py \
+    --num_patterns 94,188,376,752,1024 \
+    --dataset mnist --num_epochs 30
